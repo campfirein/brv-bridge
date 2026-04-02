@@ -1,6 +1,6 @@
 {
   "name": "@byterover/brv-bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Standard interface for connecting agent frameworks to ByteRover's Context Tree.",
   "type": "module",
   "exports": {
@@ -12,19 +12,42 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "dev": "tsc --watch",
     "test": "vitest run --dir test",
     "test:watch": "vitest --dir test",
-    "clean": "rm -rf dist"
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build && npm test"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
-  "license": "MIT",
+  "author": "ByteRover",
+  "license": "Elastic-2.0",
+  "keywords": [
+    "byterover",
+    "context-tree",
+    "agent",
+    "memory",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/campfirein/brv-bridge.git"
+  },
+  "homepage": "https://github.com/campfirein/brv-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/campfirein/brv-bridge/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
