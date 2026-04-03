@@ -106,6 +106,7 @@ async function runBrv(params: {
       cwd: params.cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
+      shell: process.platform === "win32",
     });
 
     let stdout = "";
