@@ -1,6 +1,6 @@
 {
   "name": "@byterover/brv-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Standard interface for connecting agent frameworks to ByteRover's Context Tree.",
   "type": "module",
   "exports": {
