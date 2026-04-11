@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { brvQuery, brvCurate } from "./process.js";
+import { brvQuery, brvCurate, brvSearch } from "./process.js";
 import type {
   BrvBridgeConfig,
   BrvLogger,
@@ -7,6 +7,8 @@ import type {
   RecallOptions,
   PersistResult,
   PersistOptions,
+  SearchResult,
+  SearchOptions,
 } from "./types.js";
 
 const noopLogger: BrvLogger = {
@@ -31,6 +33,7 @@ export class BrvBridge {
   private readonly cwd: string;
   private readonly recallTimeoutMs: number;
   private readonly persistTimeoutMs: number;
+  private readonly searchTimeoutMs: number;
   private readonly logger: BrvLogger;
 
   constructor(config: BrvBridgeConfig) {
@@ -38,6 +41,7 @@ export class BrvBridge {
     this.cwd = config.cwd ?? process.cwd();
     this.recallTimeoutMs = config.recallTimeoutMs ?? 10_000;
     this.persistTimeoutMs = config.persistTimeoutMs ?? 60_000;
+    this.searchTimeoutMs = config.searchTimeoutMs ?? 5_000;
     this.logger = config.logger ?? noopLogger;
   }
 
@@ -125,6 +129,48 @@ export class BrvBridge {
     } catch (err) {
       this.logger.warn(`persist failed: ${String(err)}`);
       return { status: "error", message: String(err) };
+    }
+  }
+
+  /**
+   * Search the Context Tree for structured file results.
+   * Returns ranked results with paths, scores, and excerpts.
+   * Pure BM25 retrieval — no LLM, no token cost.
+   *
+   * Unlike recall() which returns a synthesized answer, search() returns
+   * individual file-level results that can be navigated via readFile.
+   */
+  async search(
+    query: string,
+    options?: SearchOptions,
+  ): Promise<SearchResult> {
+    const empty: SearchResult = { results: [], totalFound: 0, message: "" };
+
+    if (!query.trim()) {
+      return empty;
+    }
+
+    const cwd = options?.cwd ?? this.cwd;
+
+    try {
+      const result = await brvSearch({
+        brvPath: this.brvPath,
+        cwd,
+        timeoutMs: this.searchTimeoutMs,
+        logger: this.logger,
+        query,
+        limit: options?.limit,
+        scope: options?.scope,
+      });
+
+      return {
+        results: result.data?.results ?? [],
+        totalFound: result.data?.totalFound ?? 0,
+        message: result.data?.message ?? "",
+      };
+    } catch (err) {
+      this.logger.warn(`search failed: ${String(err)}`);
+      return empty;
     }
   }
 

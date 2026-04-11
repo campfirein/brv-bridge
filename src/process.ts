@@ -10,6 +10,7 @@ import type {
   BrvJsonResponse,
   BrvQueryData,
   BrvCurateData,
+  BrvSearchData,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -259,4 +260,32 @@ export async function brvCurate(params: {
     logger: params.logger,
   });
   return parseLastJsonLine<BrvCurateData>(stdout);
+}
+
+export async function brvSearch(params: {
+  brvPath: string;
+  cwd: string;
+  timeoutMs: number;
+  logger: BrvLogger;
+  query: string;
+  limit?: number;
+  scope?: string;
+}): Promise<BrvJsonResponse<BrvSearchData>> {
+  const args = ["search", "--format", "json"];
+  if (params.limit !== undefined) {
+    args.push("--limit", String(params.limit));
+  }
+  if (params.scope) {
+    args.push("--scope", params.scope);
+  }
+  args.push("--", params.query);
+
+  const { stdout } = await runBrv({
+    brvPath: params.brvPath,
+    args,
+    cwd: params.cwd,
+    timeoutMs: params.timeoutMs,
+    logger: params.logger,
+  });
+  return parseLastJsonLine<BrvSearchData>(stdout);
 }
