@@ -6,4 +6,7 @@ export type {
   RecallOptions,
   PersistResult,
   PersistOptions,
+  SearchResult,
+  SearchResultItem,
+  SearchOptions,
 } from "./types.js";
