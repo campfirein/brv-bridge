@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { BrvBridge } from "../src/bridge.js";
 import * as process from "../src/process.js";
-import type { BrvJsonResponse, BrvQueryData, BrvCurateData } from "../src/types.js";
+import type { BrvJsonResponse, BrvQueryData, BrvCurateData, BrvSearchData } from "../src/types.js";
 
 // Mock the process module so tests don't spawn real brv CLI
 vi.mock("../src/process.js", async () => {
@@ -10,6 +10,7 @@ vi.mock("../src/process.js", async () => {
     ...actual,
     brvQuery: vi.fn(),
     brvCurate: vi.fn(),
+    brvSearch: vi.fn(),
   };
 });
 
@@ -26,6 +27,7 @@ import { existsSync } from "node:fs";
 
 const mockBrvQuery = vi.mocked(process.brvQuery);
 const mockBrvCurate = vi.mocked(process.brvCurate);
+const mockBrvSearch = vi.mocked(process.brvSearch);
 const mockExistsSync = vi.mocked(existsSync);
 
 describe("BrvBridge", () => {
@@ -217,6 +219,91 @@ describe("BrvBridge", () => {
       expect(mockBrvQuery).toHaveBeenCalledWith(
         expect.objectContaining({ cwd: globalThis.process.cwd() }),
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // search()
+  // -------------------------------------------------------------------------
+
+  describe("search", () => {
+    it("returns structured results from brv search", async () => {
+      mockBrvSearch.mockResolvedValue({
+        command: "search",
+        success: true,
+        timestamp: "t1",
+        data: {
+          status: "completed",
+          results: [
+            { path: "auth/jwt.md", title: "JWT", excerpt: "JWT tokens", score: 0.91 },
+            { path: "auth/oauth.md", title: "OAuth", excerpt: "OAuth flow", score: 0.85 },
+          ],
+          totalFound: 2,
+          message: "Found 2 results",
+        },
+      } as BrvJsonResponse<BrvSearchData>);
+
+      const result = await bridge.search("authentication");
+      expect(result.results).toHaveLength(2);
+      expect(result.results[0].path).toBe("auth/jwt.md");
+      expect(result.results[0].score).toBe(0.91);
+      expect(result.totalFound).toBe(2);
+    });
+
+    it("returns empty results for empty query", async () => {
+      const result = await bridge.search("   ");
+      expect(result.results).toHaveLength(0);
+      expect(result.totalFound).toBe(0);
+      expect(mockBrvSearch).not.toHaveBeenCalled();
+    });
+
+    it("returns empty results on search failure", async () => {
+      mockBrvSearch.mockRejectedValue(new Error("daemon not running"));
+
+      const result = await bridge.search("test query");
+      expect(result.results).toHaveLength(0);
+      expect(result.totalFound).toBe(0);
+    });
+
+    it("passes limit and scope to brvSearch", async () => {
+      mockBrvSearch.mockResolvedValue({
+        command: "search",
+        success: true,
+        timestamp: "t1",
+        data: { status: "completed", results: [], totalFound: 0, message: "" },
+      } as BrvJsonResponse<BrvSearchData>);
+
+      await bridge.search("test", { limit: 5, scope: "auth" });
+      expect(mockBrvSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 5, scope: "auth" }),
+      );
+    });
+
+    it("uses cwd override when provided", async () => {
+      mockBrvSearch.mockResolvedValue({
+        command: "search",
+        success: true,
+        timestamp: "t1",
+        data: { status: "completed", results: [], totalFound: 0, message: "" },
+      } as BrvJsonResponse<BrvSearchData>);
+
+      await bridge.search("test", { cwd: "/override/path" });
+      expect(mockBrvSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/override/path" }),
+      );
+    });
+
+    it("returns empty results when data has no results field", async () => {
+      mockBrvSearch.mockResolvedValue({
+        command: "search",
+        success: true,
+        timestamp: "t1",
+        data: { status: "completed" },
+      } as BrvJsonResponse<BrvSearchData>);
+
+      const result = await bridge.search("test");
+      expect(result.results).toHaveLength(0);
+      expect(result.totalFound).toBe(0);
     });
   });
 });
