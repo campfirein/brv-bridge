@@ -124,6 +124,74 @@ describe("BrvBridge", () => {
         expect.objectContaining({ cwd: "/override/path" }),
       );
     });
+
+    // Structured recall payload — flat shape per shared schema
+    it("surfaces matchedDocs, tier, durationMs, topScore when CLI emits them", async () => {
+      mockBrvQuery.mockResolvedValue({
+        command: "query",
+        success: true,
+        timestamp: "t1",
+        data: {
+          status: "completed",
+          result: "the answer",
+          matchedDocs: [
+            { path: "auth/jwt-tokens.md", score: 0.92, title: "JWT tokens" },
+            { path: "billing/stripe-webhooks.md", score: 0.78, title: "Stripe webhooks" },
+          ],
+          tier: 2,
+          durationMs: 184,
+          topScore: 0.92,
+        },
+      } as BrvJsonResponse<BrvQueryData>);
+
+      const result = await bridge.recall("question");
+      expect(result.content).toBe("the answer");
+      expect(result.matchedDocs).toEqual([
+        { path: "auth/jwt-tokens.md", score: 0.92, title: "JWT tokens" },
+        { path: "billing/stripe-webhooks.md", score: 0.78, title: "Stripe webhooks" },
+      ]);
+      expect(result.tier).toBe(2);
+      expect(result.durationMs).toBe(184);
+      expect(result.topScore).toBe(0.92);
+    });
+
+    it("gracefully degrades to content-only when CLI omits structured fields (older brv)", async () => {
+      mockBrvQuery.mockResolvedValue({
+        command: "query",
+        success: true,
+        timestamp: "t1",
+        data: { status: "completed", result: "old-style answer" },
+      } as BrvJsonResponse<BrvQueryData>);
+
+      const result = await bridge.recall("question");
+      expect(result.content).toBe("old-style answer");
+      expect(result.matchedDocs).toBeUndefined();
+      expect(result.tier).toBeUndefined();
+      expect(result.durationMs).toBeUndefined();
+      expect(result.topScore).toBeUndefined();
+    });
+
+    it("returns matchedDocs even on cache hits with empty array", async () => {
+      mockBrvQuery.mockResolvedValue({
+        command: "query",
+        success: true,
+        timestamp: "t1",
+        data: {
+          status: "completed",
+          result: "cached answer",
+          matchedDocs: [],
+          tier: 0,
+          durationMs: 3,
+        },
+      } as BrvJsonResponse<BrvQueryData>);
+
+      const result = await bridge.recall("question");
+      expect(result.content).toBe("cached answer");
+      expect(result.matchedDocs).toEqual([]);
+      expect(result.tier).toBe(0);
+      expect(result.durationMs).toBe(3);
+      expect(result.topScore).toBeUndefined();
+    });
   });
 
   // -------------------------------------------------------------------------
