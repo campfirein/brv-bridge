@@ -39,9 +39,50 @@ export type RecallOptions = {
   cwd?: string;
 };
 
+/** Single matched document returned by ByteRover's query layer. */
+export type RecallMatchedDoc = {
+  /** Relative path within the context tree (e.g. "auth/jwt-tokens.md"). */
+  path: string;
+  /** Compound score combining BM25 relevance, importance, recency, and maturity tier boost. */
+  score: number;
+  /** Title from the document's frontmatter (or first heading as fallback). */
+  title: string;
+};
+
+/**
+ * Resolution tier reported by the query layer.
+ *  0: exact cache hit
+ *  1: fuzzy cache match
+ *  2: BM25 direct response (no LLM)
+ *  3: LLM with prefetched context
+ *  4: full agentic loop
+ */
+export type RecallTier = 0 | 1 | 2 | 3 | 4;
+
 export type RecallResult = {
   /** The retrieved context string. Empty string if nothing relevant found. */
   content: string;
+  /**
+   * Documents matched by the query layer. Empty array on cache hits (the cached payload
+   * does not preserve match metadata). Absent when the brv CLI does not surface this field —
+   * callers must treat undefined as "metadata unavailable" and degrade gracefully.
+   */
+  matchedDocs?: RecallMatchedDoc[];
+  /**
+   * Resolution tier (0-4). Absent on older CLIs.
+   * Plumbed through for future visibility surfaces (cache-hit badge, tier label).
+   */
+  tier?: RecallTier;
+  /**
+   * Wall-clock execution time in milliseconds. Absent on older CLIs.
+   * Plumbed through for future visibility surfaces (latency annotation).
+   */
+  durationMs?: number;
+  /**
+   * Top compound score across `matchedDocs`. Absent on cache hits and on older CLIs.
+   * Plumbed through for future visibility surfaces (relevance badge).
+   */
+  topScore?: number;
 };
 
 export type PersistOptions = {
@@ -111,6 +152,11 @@ export type BrvQueryData = {
   content?: string;
   message?: string;
   error?: string;
+  /** Structured recall payload surfaced by newer `brv query --format json` envelopes; absent on older CLIs. */
+  matchedDocs?: RecallMatchedDoc[];
+  tier?: RecallTier;
+  durationMs?: number;
+  topScore?: number;
 };
 
 export type BrvSearchData = {
