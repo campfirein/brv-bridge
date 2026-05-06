@@ -85,7 +85,23 @@ export class BrvBridge {
       });
 
       const content = result.data?.result ?? result.data?.content ?? "";
-      return { content: content.trim() };
+      // Surface the structured payload when the CLI provides it; fall back gracefully to
+      // content-only when older CLIs omit these fields. Spread conditionally so callers can
+      // rely on `matchedDocs === undefined` to detect "metadata unavailable".
+      const recall: RecallResult = { content: content.trim() };
+      if (result.data?.matchedDocs !== undefined) {
+        recall.matchedDocs = result.data.matchedDocs;
+      }
+      if (result.data?.tier !== undefined) {
+        recall.tier = result.data.tier;
+      }
+      if (result.data?.durationMs !== undefined) {
+        recall.durationMs = result.data.durationMs;
+      }
+      if (result.data?.topScore !== undefined) {
+        recall.topScore = result.data.topScore;
+      }
+      return recall;
     } catch (err) {
       const msg = String(err);
       if (msg.includes("aborted")) {
