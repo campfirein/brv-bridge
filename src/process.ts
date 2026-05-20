@@ -6,11 +6,14 @@ import {
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import type {
-  BrvLogger,
-  BrvJsonResponse,
-  BrvQueryData,
+  BrvCurateContinueData,
   BrvCurateData,
+  BrvCurateKickoffData,
+  BrvJsonResponse,
+  BrvLogger,
+  BrvQueryData,
   BrvSearchData,
+  CurateMeta,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -223,9 +226,14 @@ export async function brvQuery(params: {
   timeoutMs: number;
   logger: BrvLogger;
   query: string;
+  limit?: number;
   signal?: AbortSignal;
 }): Promise<BrvJsonResponse<BrvQueryData>> {
-  const args = ["query", "--format", "json", "--", params.query];
+  const args = ["query", "--format", "json"];
+  if (params.limit !== undefined) {
+    args.push("--limit", String(params.limit));
+  }
+  args.push("--", params.query);
 
   const { stdout } = await runBrv({
     brvPath: params.brvPath,
@@ -238,6 +246,12 @@ export async function brvQuery(params: {
   return parseLastJsonLine<BrvQueryData>(stdout);
 }
 
+/**
+ * @deprecated v2.0 — only kept so consumers that imported `brvCurate` as a
+ * type-or-symbol from this module continue to compile. The bridge no longer
+ * calls it (`BrvBridge.persist()` throws). Use `brvCurateKickoff` +
+ * `brvCurateContinue` for the new session protocol. Removed in v3.0.
+ */
 export async function brvCurate(params: {
   brvPath: string;
   cwd: string;
@@ -260,6 +274,84 @@ export async function brvCurate(params: {
     logger: params.logger,
   });
   return parseLastJsonLine<BrvCurateData>(stdout);
+}
+
+/**
+ * Kickoff phase of the curate session protocol.
+ *
+ * `brv curate "<intent>" --format json` returns a sessionId and the
+ * authoring prompt. The calling bridge typically discards the prompt (its
+ * agent already authored HTML) and only retains the sessionId for the
+ * continuation call.
+ */
+export async function brvCurateKickoff(params: {
+  brvPath: string;
+  cwd: string;
+  timeoutMs: number;
+  logger: BrvLogger;
+  /** Placeholder intent string. Marked clearly so it's distinguishable in telemetry. */
+  intent: string;
+  signal?: AbortSignal;
+}): Promise<BrvJsonResponse<BrvCurateKickoffData>> {
+  const args = ["curate", "--format", "json", "--", params.intent];
+
+  const { stdout } = await runBrv({
+    brvPath: params.brvPath,
+    args,
+    cwd: params.cwd,
+    timeoutMs: params.timeoutMs,
+    logger: params.logger,
+    signal: params.signal,
+  });
+  return parseLastJsonLine<BrvCurateKickoffData>(stdout);
+}
+
+/**
+ * Continuation phase of the curate session protocol.
+ *
+ * Submits the JSON envelope `{html, meta?}` as `--response`. On success the
+ * daemon writes the topic; on failure the response carries `step:
+ * 'correct-html'` with structured errors. `confirmOverwrite` rides on the
+ * `--overwrite` CLI flag, not inside the envelope, matching the M4
+ * protocol.
+ */
+export async function brvCurateContinue(params: {
+  brvPath: string;
+  cwd: string;
+  timeoutMs: number;
+  logger: BrvLogger;
+  sessionId: string;
+  html: string;
+  meta?: CurateMeta;
+  confirmOverwrite?: boolean;
+  signal?: AbortSignal;
+}): Promise<BrvJsonResponse<BrvCurateContinueData>> {
+  const envelope = params.meta !== undefined
+    ? JSON.stringify({ html: params.html, meta: params.meta })
+    : JSON.stringify({ html: params.html });
+
+  const args = [
+    "curate",
+    "--session",
+    params.sessionId,
+    "--response",
+    envelope,
+    "--format",
+    "json",
+  ];
+  if (params.confirmOverwrite) {
+    args.push("--overwrite");
+  }
+
+  const { stdout } = await runBrv({
+    brvPath: params.brvPath,
+    args,
+    cwd: params.cwd,
+    timeoutMs: params.timeoutMs,
+    logger: params.logger,
+    signal: params.signal,
+  });
+  return parseLastJsonLine<BrvCurateContinueData>(stdout);
 }
 
 export async function brvSearch(params: {

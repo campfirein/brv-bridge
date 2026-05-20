@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { BrvBridge } from "../src/bridge.js";
 import * as process from "../src/process.js";
-import type { BrvJsonResponse, BrvQueryData, BrvCurateData, BrvSearchData } from "../src/types.js";
+import type {
+  BrvCurateContinueData,
+  BrvCurateKickoffData,
+  BrvJsonResponse,
+  BrvQueryData,
+  BrvSearchData,
+} from "../src/types.js";
 
 // Mock the process module so tests don't spawn real brv CLI
 vi.mock("../src/process.js", async () => {
@@ -9,8 +15,9 @@ vi.mock("../src/process.js", async () => {
   return {
     ...actual,
     brvQuery: vi.fn(),
-    brvCurate: vi.fn(),
     brvSearch: vi.fn(),
+    brvCurateKickoff: vi.fn(),
+    brvCurateContinue: vi.fn(),
   };
 });
 
@@ -26,9 +33,70 @@ vi.mock("node:fs", async () => {
 import { existsSync } from "node:fs";
 
 const mockBrvQuery = vi.mocked(process.brvQuery);
-const mockBrvCurate = vi.mocked(process.brvCurate);
 const mockBrvSearch = vi.mocked(process.brvSearch);
+const mockBrvCurateKickoff = vi.mocked(process.brvCurateKickoff);
+const mockBrvCurateContinue = vi.mocked(process.brvCurateContinue);
 const mockExistsSync = vi.mocked(existsSync);
+
+function kickoffEnvelope(overrides: Partial<BrvCurateKickoffData> = {}): BrvJsonResponse<BrvCurateKickoffData> {
+  return {
+    command: "curate",
+    success: true,
+    timestamp: "t1",
+    data: {
+      status: "needs-llm-step",
+      step: "generate-html",
+      sessionId: "sess-abc",
+      prompt: "(discarded)",
+      ...overrides,
+    },
+  };
+}
+
+function continueDoneEnvelope(filePath = "security/auth.html"): BrvJsonResponse<BrvCurateContinueData> {
+  return {
+    command: "curate",
+    success: true,
+    timestamp: "t2",
+    data: { ok: true, status: "done", filePath },
+  };
+}
+
+function continueFailedEnvelope(errors = [{ kind: "validation-failed", message: "bad html" }]): BrvJsonResponse<BrvCurateContinueData> {
+  return {
+    command: "curate",
+    success: true,
+    timestamp: "t2",
+    data: {
+      ok: false,
+      status: "failed",
+      sessionId: "sess-abc",
+      step: "correct-html",
+      errors,
+    },
+  };
+}
+
+// Helper — build a query envelope with sane metadata defaults
+function queryEnvelope(overrides: Partial<BrvQueryData> = {}): BrvJsonResponse<BrvQueryData> {
+  return {
+    command: "query",
+    success: true,
+    timestamp: "t1",
+    data: {
+      status: "ok",
+      matchedDocs: [],
+      metadata: {
+        durationMs: 0,
+        skippedSharedCount: 0,
+        tier: 2,
+        topScore: 0,
+        totalFound: 0,
+      },
+      ...overrides,
+    },
+  };
+}
 
 describe("BrvBridge", () => {
   let bridge: BrvBridge;
@@ -50,14 +118,12 @@ describe("BrvBridge", () => {
     });
 
     it("returns false when cwd does not exist", async () => {
-      mockExistsSync.mockImplementation((p) => false);
+      mockExistsSync.mockImplementation(() => false);
       expect(await bridge.ready()).toBe(false);
     });
 
     it("returns false when .brv directory is missing", async () => {
-      mockExistsSync.mockImplementation((p) => {
-        return !String(p).endsWith(".brv");
-      });
+      mockExistsSync.mockImplementation((p) => !String(p).endsWith(".brv"));
       expect(await bridge.ready()).toBe(false);
     });
   });
@@ -67,31 +133,80 @@ describe("BrvBridge", () => {
   // -------------------------------------------------------------------------
 
   describe("recall", () => {
-    it("returns content from brv query", async () => {
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: { status: "completed", result: "the answer" },
-      } as BrvJsonResponse<BrvQueryData>);
+    it("concatenates rendered_md from matchedDocs with the markdown separator", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope({
+        status: "ok",
+        matchedDocs: [
+          { format: "html", path: "auth/jwt.md", rendered_md: "## JWT\nUse RS256.", score: 0.92, title: "JWT" },
+          { format: "markdown", path: "billing/stripe.md", rendered_md: "## Stripe\nWebhook.", score: 0.78, title: "Stripe" },
+        ],
+        metadata: {
+          durationMs: 184,
+          skippedSharedCount: 0,
+          tier: 2,
+          topScore: 0.92,
+          totalFound: 2,
+        },
+      }));
 
       const result = await bridge.recall("what is the auth flow?");
-      expect(result.content).toBe("the answer");
+      expect(result.content).toBe(
+        "## JWT\nUse RS256.\n\n---\n\n## Stripe\nWebhook.",
+      );
+      expect(result.matchedDocs).toHaveLength(2);
+      expect(result.matchedDocs![0].path).toBe("auth/jwt.md");
+      expect(result.tier).toBe(2);
+      expect(result.durationMs).toBe(184);
+      expect(result.topScore).toBe(0.92);
     });
 
-    it("returns content from data.content field", async () => {
+    it("returns empty content (and empty matchedDocs) on status: no-matches", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope({
+        status: "no-matches",
+        matchedDocs: [],
+        metadata: {
+          durationMs: 5,
+          skippedSharedCount: 0,
+          tier: 2,
+          topScore: 0,
+          totalFound: 0,
+        },
+      }));
+
+      const result = await bridge.recall("nothing matches this");
+      expect(result.content).toBe("");
+      expect(result.matchedDocs).toEqual([]);
+      expect(result.tier).toBe(2);
+      expect(result.durationMs).toBe(5);
+      expect(result.topScore).toBeUndefined(); // no matches → no topScore surfacing
+    });
+
+    it("reads metadata fields from data.metadata.*, NOT data.* directly", async () => {
+      // Drift guard: an envelope that leaves metadata fields at the top level
+      // (the pre-v2 shape) must NOT surface them. The bridge looks at
+      // data.metadata only.
       mockBrvQuery.mockResolvedValue({
         command: "query",
         success: true,
         timestamp: "t1",
-        data: { status: "completed", content: "alt answer" },
-      } as BrvJsonResponse<BrvQueryData>);
+        data: {
+          status: "ok",
+          matchedDocs: [
+            { format: "html", path: "x/y.md", rendered_md: "body", score: 0.5, title: "x/y" },
+          ],
+          // Intentionally MISSING metadata field — pretend the daemon emitted
+          // the legacy flat shape. Surface nothing.
+        } as unknown as BrvQueryData,
+      });
 
-      const result = await bridge.recall("question");
-      expect(result.content).toBe("alt answer");
+      const result = await bridge.recall("test");
+      expect(result.content).toBe("body");
+      expect(result.tier).toBeUndefined();
+      expect(result.durationMs).toBeUndefined();
+      expect(result.topScore).toBeUndefined();
     });
 
-    it("returns empty content for empty query", async () => {
+    it("returns empty content for empty query (does not spawn brv)", async () => {
       const result = await bridge.recall("   ");
       expect(result.content).toBe("");
       expect(mockBrvQuery).not.toHaveBeenCalled();
@@ -112,12 +227,7 @@ describe("BrvBridge", () => {
     });
 
     it("uses cwd override when provided", async () => {
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: { status: "completed", result: "answer" },
-      } as BrvJsonResponse<BrvQueryData>);
+      mockBrvQuery.mockResolvedValue(queryEnvelope());
 
       await bridge.recall("query", { cwd: "/override/path" });
       expect(mockBrvQuery).toHaveBeenCalledWith(
@@ -125,137 +235,266 @@ describe("BrvBridge", () => {
       );
     });
 
-    // Structured recall payload — flat shape per shared schema
-    it("surfaces matchedDocs, tier, durationMs, topScore when CLI emits them", async () => {
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: {
-          status: "completed",
-          result: "the answer",
-          matchedDocs: [
-            { path: "auth/jwt-tokens.md", score: 0.92, title: "JWT tokens" },
-            { path: "billing/stripe-webhooks.md", score: 0.78, title: "Stripe webhooks" },
-          ],
-          tier: 2,
-          durationMs: 184,
-          topScore: 0.92,
-        },
-      } as BrvJsonResponse<BrvQueryData>);
+    it("passes limit through to brvQuery", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope());
 
-      const result = await bridge.recall("question");
-      expect(result.content).toBe("the answer");
-      expect(result.matchedDocs).toEqual([
-        { path: "auth/jwt-tokens.md", score: 0.92, title: "JWT tokens" },
-        { path: "billing/stripe-webhooks.md", score: 0.78, title: "Stripe webhooks" },
-      ]);
-      expect(result.tier).toBe(2);
-      expect(result.durationMs).toBe(184);
-      expect(result.topScore).toBe(0.92);
+      await bridge.recall("query", { limit: 5 });
+      expect(mockBrvQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 5 }),
+      );
     });
 
-    it("gracefully degrades to content-only when CLI omits structured fields (older brv)", async () => {
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: { status: "completed", result: "old-style answer" },
-      } as BrvJsonResponse<BrvQueryData>);
+    it("filters out empty rendered_md entries before joining", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope({
+        matchedDocs: [
+          { format: "html", path: "a.md", rendered_md: "alpha", score: 0.9, title: "a" },
+          { format: "html", path: "b.md", rendered_md: "", score: 0.8, title: "b" },
+          { format: "html", path: "c.md", rendered_md: "gamma", score: 0.7, title: "c" },
+        ],
+      }));
 
-      const result = await bridge.recall("question");
-      expect(result.content).toBe("old-style answer");
-      expect(result.matchedDocs).toBeUndefined();
-      expect(result.tier).toBeUndefined();
-      expect(result.durationMs).toBeUndefined();
-      expect(result.topScore).toBeUndefined();
-    });
-
-    it("returns matchedDocs even on cache hits with empty array", async () => {
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: {
-          status: "completed",
-          result: "cached answer",
-          matchedDocs: [],
-          tier: 0,
-          durationMs: 3,
-        },
-      } as BrvJsonResponse<BrvQueryData>);
-
-      const result = await bridge.recall("question");
-      expect(result.content).toBe("cached answer");
-      expect(result.matchedDocs).toEqual([]);
-      expect(result.tier).toBe(0);
-      expect(result.durationMs).toBe(3);
-      expect(result.topScore).toBeUndefined();
+      const result = await bridge.recall("test");
+      // Empty middle entry should not produce a "---\n\n\n\n---" gap
+      expect(result.content).toBe("alpha\n\n---\n\ngamma");
     });
   });
 
   // -------------------------------------------------------------------------
-  // persist()
+  // queryEnvelope()
   // -------------------------------------------------------------------------
 
-  describe("persist", () => {
-    it("curates context with detach by default", async () => {
-      mockBrvCurate.mockResolvedValue({
-        command: "curate",
-        success: true,
-        timestamp: "t1",
-        data: { status: "queued", taskId: "abc" },
-      } as BrvJsonResponse<BrvCurateData>);
+  describe("queryEnvelope", () => {
+    it("returns the raw QueryToolModeResult envelope shape verbatim", async () => {
+      const env = queryEnvelope({
+        status: "ok",
+        matchedDocs: [
+          { format: "html", path: "a.md", rendered_md: "alpha", score: 0.9, title: "a" },
+        ],
+        metadata: {
+          cacheHit: "fuzzy",
+          durationMs: 50,
+          skippedSharedCount: 2,
+          tier: 1,
+          topScore: 0.9,
+          totalFound: 1,
+        },
+      });
+      mockBrvQuery.mockResolvedValue(env);
 
-      const result = await bridge.persist("user prefers dark mode");
-      expect(result.status).toBe("queued");
-      expect(mockBrvCurate).toHaveBeenCalledWith(
-        expect.objectContaining({ detach: true }),
+      const result = await bridge.queryEnvelope("question");
+      // No field renaming, no derivation — the bridge just hands back data.
+      expect(result).toEqual(env.data);
+    });
+
+    it("passes limit through as --limit", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope());
+      await bridge.queryEnvelope("query", { limit: 3 });
+      expect(mockBrvQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 3 }),
       );
-    });
-
-    it("supports non-detach mode", async () => {
-      mockBrvCurate.mockResolvedValue({
-        command: "curate",
-        success: true,
-        timestamp: "t1",
-        data: { status: "completed" },
-      } as BrvJsonResponse<BrvCurateData>);
-
-      const result = await bridge.persist("some context", { detach: false });
-      expect(result.status).toBe("completed");
-      expect(mockBrvCurate).toHaveBeenCalledWith(
-        expect.objectContaining({ detach: false }),
-      );
-    });
-
-    it("skips empty context", async () => {
-      const result = await bridge.persist("   ");
-      expect(result.status).toBe("completed");
-      expect(result.message).toBe("empty context, skipped");
-      expect(mockBrvCurate).not.toHaveBeenCalled();
-    });
-
-    it("returns error status on failure", async () => {
-      mockBrvCurate.mockRejectedValue(new Error("brv curate failed"));
-
-      const result = await bridge.persist("some context");
-      expect(result.status).toBe("error");
-      expect(result.message).toContain("brv curate failed");
     });
 
     it("uses cwd override when provided", async () => {
-      mockBrvCurate.mockResolvedValue({
+      mockBrvQuery.mockResolvedValue(queryEnvelope());
+      await bridge.queryEnvelope("query", { cwd: "/override" });
+      expect(mockBrvQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/override" }),
+      );
+    });
+
+    it("throws on subprocess failure (unlike recall, which swallows)", async () => {
+      mockBrvQuery.mockRejectedValue(new Error("brv query failed"));
+      await expect(bridge.queryEnvelope("query")).rejects.toThrow(/brv query failed/);
+    });
+
+    it("returns no-matches envelope without throwing", async () => {
+      mockBrvQuery.mockResolvedValue(queryEnvelope({
+        status: "no-matches",
+        matchedDocs: [],
+        metadata: {
+          durationMs: 5,
+          skippedSharedCount: 0,
+          tier: 2,
+          topScore: 0,
+          totalFound: 0,
+        },
+      }));
+
+      const result = await bridge.queryEnvelope("nothing");
+      expect(result.status).toBe("no-matches");
+      expect(result.matchedDocs).toEqual([]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // persistHtml()
+  // -------------------------------------------------------------------------
+
+  describe("persistHtml", () => {
+    const VALID_HTML = '<bv-topic path="security/auth" title="Auth"></bv-topic>';
+
+    it("happy path: runs kickoff + continuation, returns ok envelope", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope("security/auth.html"));
+
+      const result = await bridge.persistHtml({ html: VALID_HTML });
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.filePath).toBe("security/auth.html");
+        expect(result.topicPath).toBe("security/auth"); // .html stripped
+        expect(result.overwrote).toBe(false); // v1: not surfaced yet
+      }
+    });
+
+    it("plumbs sessionId from kickoff into continuation", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope({ sessionId: "sess-xyz" }));
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+
+      await bridge.persistHtml({ html: VALID_HTML });
+
+      expect(mockBrvCurateContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "sess-xyz" }),
+      );
+    });
+
+    it("threads html + meta into the continuation envelope", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+
+      const meta = {
+        type: "ADD" as const,
+        impact: "high" as const,
+        reason: "load-bearing decision",
+        summary: "RS256 chosen",
+      };
+      await bridge.persistHtml({ html: VALID_HTML, meta });
+
+      expect(mockBrvCurateContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ html: VALID_HTML, meta }),
+      );
+    });
+
+    it("passes confirmOverwrite through to the continuation helper", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+
+      await bridge.persistHtml({ html: VALID_HTML, confirmOverwrite: true });
+
+      expect(mockBrvCurateContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ confirmOverwrite: true }),
+      );
+    });
+
+    it("returns validation-failed with errors when continuation reports failure", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueFailedEnvelope([
+        { kind: "missing-bv-topic", message: "no <bv-topic> root" },
+      ]));
+
+      const result = await bridge.persistHtml({ html: "<div>not a topic</div>" });
+
+      expect(result.status).toBe("validation-failed");
+      if (result.status === "validation-failed") {
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0].kind).toBe("missing-bv-topic");
+      }
+    });
+
+    it("propagates kickoff subprocess failures (does NOT swallow)", async () => {
+      mockBrvCurateKickoff.mockRejectedValue(new Error("brv curate timed out after 60000ms"));
+
+      await expect(bridge.persistHtml({ html: VALID_HTML })).rejects.toThrow(/timed out/);
+      expect(mockBrvCurateContinue).not.toHaveBeenCalled();
+    });
+
+    it("propagates continuation subprocess failures", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockRejectedValue(new Error("brv curate aborted"));
+
+      await expect(bridge.persistHtml({ html: VALID_HTML })).rejects.toThrow(/aborted/);
+    });
+
+    it("throws if kickoff omits sessionId (defensive)", async () => {
+      mockBrvCurateKickoff.mockResolvedValue({
         command: "curate",
         success: true,
         timestamp: "t1",
-        data: { status: "queued" },
-      } as BrvJsonResponse<BrvCurateData>);
+        data: { status: "needs-llm-step", step: "generate-html", prompt: "p" } as unknown as BrvCurateKickoffData,
+      });
 
-      await bridge.persist("some context", { cwd: "/override/path" });
-      expect(mockBrvCurate).toHaveBeenCalledWith(
-        expect.objectContaining({ cwd: "/override/path" }),
+      await expect(bridge.persistHtml({ html: VALID_HTML })).rejects.toThrow(/sessionId/);
+    });
+
+    it("uses cwd override on both subprocess calls", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+
+      await bridge.persistHtml({ html: VALID_HTML }, { cwd: "/override" });
+
+      expect(mockBrvCurateKickoff).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/override" }),
       );
+      expect(mockBrvCurateContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/override" }),
+      );
+    });
+
+    it("forwards signal to both subprocess calls for cancellation", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+      const signal = new AbortController().signal;
+
+      await bridge.persistHtml({ html: VALID_HTML }, { signal });
+
+      expect(mockBrvCurateKickoff).toHaveBeenCalledWith(
+        expect.objectContaining({ signal }),
+      );
+      expect(mockBrvCurateContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ signal }),
+      );
+    });
+
+    it("uses kickoff placeholder marker as intent (distinguishable in telemetry)", async () => {
+      mockBrvCurateKickoff.mockResolvedValue(kickoffEnvelope());
+      mockBrvCurateContinue.mockResolvedValue(continueDoneEnvelope());
+
+      await bridge.persistHtml({ html: VALID_HTML });
+
+      // The intent string is what shows up in the daemon's curate-log
+      // 'input.context' field. Use a marker that's clearly bridge-originated.
+      expect(mockBrvCurateKickoff).toHaveBeenCalledWith(
+        expect.objectContaining({ intent: expect.stringContaining("brv-bridge") }),
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // persist() — throws migration error in v2.0
+  // -------------------------------------------------------------------------
+
+  describe("persist (deprecated)", () => {
+    it("throws a clear migration error pointing at persistHtml", async () => {
+      await expect(bridge.persist("some context")).rejects.toThrow(
+        /persistHtml/,
+      );
+    });
+
+    it("throws regardless of whether context is empty or non-empty", async () => {
+      await expect(bridge.persist("")).rejects.toThrow();
+      await expect(bridge.persist("non-empty")).rejects.toThrow();
+    });
+
+    it("error message references v2.0 and the new API", async () => {
+      try {
+        await bridge.persist("anything");
+        expect.fail("persist() should have thrown");
+      } catch (err) {
+        const msg = (err as Error).message;
+        expect(msg).toContain("v2.0");
+        expect(msg).toContain("persistHtml");
+        expect(msg).toMatch(/<bv-topic>/);
+      }
     });
   });
 
@@ -276,12 +515,7 @@ describe("BrvBridge", () => {
   describe("constructor", () => {
     it("defaults cwd to process.cwd()", async () => {
       const defaultBridge = new BrvBridge({});
-      mockBrvQuery.mockResolvedValue({
-        command: "query",
-        success: true,
-        timestamp: "t1",
-        data: { status: "completed", result: "answer" },
-      } as BrvJsonResponse<BrvQueryData>);
+      mockBrvQuery.mockResolvedValue(queryEnvelope());
 
       await defaultBridge.recall("test query");
       expect(mockBrvQuery).toHaveBeenCalledWith(

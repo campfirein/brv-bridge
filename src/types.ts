@@ -29,7 +29,56 @@ export type BrvBridgeConfig = {
 };
 
 // ---------------------------------------------------------------------------
-// Operation options and results
+// Query / recall — canonical envelope shape from `brv query --format json`.
+// Mirrors `QueryToolModeResult` in byterover-cli's i-query-executor.ts.
+// Renaming any field on these types is a breaking change.
+// ---------------------------------------------------------------------------
+
+/**
+ * One retrieved doc returned by ByteRover's query layer. `rendered_md` is
+ * snake_case to match the JSON wire envelope.
+ */
+export type QueryToolModeMatchedDoc = {
+  format: "html" | "markdown";
+  path: string;
+  /** Rendered markdown body. The bridge's `recall().content` concatenates these. */
+  rendered_md: string;
+  score: number;
+  title: string;
+};
+
+/** Observability + cache signals carried alongside the matches. */
+export type QueryToolModeMetadata = {
+  /**
+   * Which cache layer served the response. `null` when retrieval ran fresh
+   * (no cache hit) or when the cache is disabled.
+   */
+  cacheHit?: "exact" | "fuzzy" | null;
+  durationMs: number;
+  /**
+   * Number of BM25 matches dropped because they originated from a shared
+   * source. v1 of tool mode is local-only.
+   */
+  skippedSharedCount: number;
+  /** 0 = exact cache, 1 = fuzzy cache, 2 = direct search (no LLM). */
+  tier: number;
+  topScore: number;
+  totalFound: number;
+};
+
+/**
+ * Wire envelope returned by every tool-mode query call. One-shot.
+ * - `status: 'ok'` — retrieval ran and produced one or more matches.
+ * - `status: 'no-matches'` — retrieval ran cleanly but BM25 found nothing.
+ */
+export type QueryToolModeResult = {
+  matchedDocs: QueryToolModeMatchedDoc[];
+  metadata: QueryToolModeMetadata;
+  status: "no-matches" | "ok";
+};
+
+// ---------------------------------------------------------------------------
+// Recall result (public bridge surface)
 // ---------------------------------------------------------------------------
 
 export type RecallOptions = {
@@ -37,16 +86,8 @@ export type RecallOptions = {
   signal?: AbortSignal;
   /** Override the default cwd for this operation. */
   cwd?: string;
-};
-
-/** Single matched document returned by ByteRover's query layer. */
-export type RecallMatchedDoc = {
-  /** Relative path within the context tree (e.g. "auth/jwt-tokens.md"). */
-  path: string;
-  /** Compound score combining BM25 relevance, importance, recency, and maturity tier boost. */
-  score: number;
-  /** Title from the document's frontmatter (or first heading as fallback). */
-  title: string;
+  /** Max matches to return. Defaults to 10. Bounded 1-50 by the CLI flag. */
+  limit?: number;
 };
 
 /**
@@ -54,48 +95,133 @@ export type RecallMatchedDoc = {
  *  0: exact cache hit
  *  1: fuzzy cache match
  *  2: BM25 direct response (no LLM)
- *  3: LLM with prefetched context
- *  4: full agentic loop
  */
-export type RecallTier = 0 | 1 | 2 | 3 | 4;
+export type RecallTier = 0 | 1 | 2;
+
+/**
+ * Single matched document — kept for back-compat with callers that read
+ * `RecallResult.matchedDocs`. Mirrors `QueryToolModeMatchedDoc`.
+ */
+export type RecallMatchedDoc = QueryToolModeMatchedDoc;
 
 export type RecallResult = {
-  /** The retrieved context string. Empty string if nothing relevant found. */
+  /**
+   * Retrieved context. Concatenation of `matchedDocs[].rendered_md`
+   * separated by `\n\n---\n\n`. Empty string when no matches.
+   */
   content: string;
   /**
-   * Documents matched by the query layer. Empty array on cache hits (the cached payload
-   * does not preserve match metadata). Absent when the brv CLI does not surface this field —
-   * callers must treat undefined as "metadata unavailable" and degrade gracefully.
+   * Documents matched by the query layer. Empty array on `no-matches` or
+   * cache hits with stripped metadata. Undefined when the recall failed
+   * before the daemon answered (network error, timeout, etc.).
    */
   matchedDocs?: RecallMatchedDoc[];
-  /**
-   * Resolution tier (0-4). Absent on older CLIs.
-   * Plumbed through for future visibility surfaces (cache-hit badge, tier label).
-   */
+  /** Resolution tier (0-2). Undefined on failure. */
   tier?: RecallTier;
-  /**
-   * Wall-clock execution time in milliseconds. Absent on older CLIs.
-   * Plumbed through for future visibility surfaces (latency annotation).
-   */
+  /** Wall-clock execution time in milliseconds. Undefined on failure. */
   durationMs?: number;
-  /**
-   * Top compound score across `matchedDocs`. Absent on cache hits and on older CLIs.
-   * Plumbed through for future visibility surfaces (relevance badge).
-   */
+  /** Top score across `matchedDocs`. Undefined when `matchedDocs` is empty. */
   topScore?: number;
 };
 
-export type PersistOptions = {
-  /** Fire-and-forget mode — CLI returns immediately, daemon processes async. Defaults to true. */
-  detach?: boolean;
+// ---------------------------------------------------------------------------
+// Query envelope (raw passthrough for callers that want the wire shape)
+// ---------------------------------------------------------------------------
+
+export type QueryEnvelopeOptions = {
+  signal?: AbortSignal;
+  cwd?: string;
+  limit?: number;
+};
+
+// ---------------------------------------------------------------------------
+// Curate / persist
+// ---------------------------------------------------------------------------
+
+/**
+ * Operation metadata supplied by the calling agent's LLM. Drives the HITL
+ * review pipeline. Mirrors byterover-cli's `CurateMeta`.
+ */
+export type CurateMeta = {
+  /** `'ADD'` for net-new topic, `'UPDATE'` for replacing existing, `'MERGE'` after path-exists. */
+  type?: "ADD" | "UPDATE" | "MERGE";
+  /** `'high'` surfaces the operation in `brv review pending`. */
+  impact?: "high" | "low";
+  /** One-sentence rationale shown to human reviewers. */
+  reason?: string;
+  /** One-line semantic summary of the topic. */
+  summary?: string;
+  /** UPDATE/MERGE: one-line summary of what existed before. */
+  previousSummary?: string;
+  confidence?: "high" | "low";
+};
+
+export type PersistHtmlInput = {
+  /** Full <bv-topic>...</bv-topic> document authored by the calling agent. */
+  html: string;
+  /** Optional operation metadata. Omitting `meta` means the curate succeeds without HITL surfacing. */
+  meta?: CurateMeta;
+  /** Pass through to the writer to allow overwriting an existing topic at the same path. */
+  confirmOverwrite?: boolean;
+};
+
+export type PersistHtmlOptions = {
+  /** AbortSignal for caller-controlled cancellation. Covers both kickoff and continuation subprocesses. */
+  signal?: AbortSignal;
   /** Override the default cwd for this operation. */
   cwd?: string;
 };
 
+/** One per-error item returned by the daemon on validation failure. */
+export type PersistHtmlError = {
+  kind: string;
+  message: string;
+  field?: string;
+  tag?: string;
+};
+
+export type PersistHtmlResult =
+  | {
+      status: "ok";
+      /** Relative filesystem path of the written topic (e.g. "security/auth.html"). */
+      filePath: string;
+      /** Logical topic path (extensionless: "security/auth"). */
+      topicPath: string;
+      /**
+       * `true` if a topic at this path existed before this call. Set to
+       * `false` in v1 because the session-protocol response doesn't yet
+       * surface it; promoted to the real value when byterover-cli's
+       * continuation envelope gains the field.
+       */
+      overwrote: boolean;
+    }
+  | {
+      status: "validation-failed";
+      errors: PersistHtmlError[];
+    };
+
+// ---------------------------------------------------------------------------
+// Legacy persist surface — kept for back-compat type imports only.
+// `BrvBridge.persist()` throws a migration error in v2.0; the types stay
+// exported with `@deprecated` so consumer builds that import the types
+// (without invoking the method) continue to compile. Removed in v3.0.
+// ---------------------------------------------------------------------------
+
+/** @deprecated Removed in v3.0. Use `PersistHtmlOptions` with `BrvBridge.persistHtml()`. */
+export type PersistOptions = {
+  detach?: boolean;
+  cwd?: string;
+};
+
+/** @deprecated Removed in v3.0. Use `PersistHtmlResult` with `BrvBridge.persistHtml()`. */
 export type PersistResult = {
   status: "completed" | "queued" | "error";
   message?: string;
 };
+
+// ---------------------------------------------------------------------------
+// Search (unchanged in v2.0 — `brv search` is unaffected by tool-mode)
+// ---------------------------------------------------------------------------
 
 export type SearchOptions = {
   /** Maximum number of results (1-50, default 10). */
@@ -107,28 +233,18 @@ export type SearchOptions = {
 };
 
 export type SearchResultItem = {
-  /** Relative path in the context tree (e.g. "auth/jwt-tokens.md"). */
   path: string;
-  /** Topic title from frontmatter. */
   title: string;
-  /** Content excerpt that matched the query. */
   excerpt: string;
-  /** Normalized BM25 relevance score (0-1). */
   score: number;
-  /** Symbol kind: "domain", "topic", "subtopic", "context", "archive_stub", "summary". */
   symbolKind?: string;
-  /** Number of other context tree files that reference this one. */
   backlinkCount?: number;
-  /** Top related file paths (max 3). */
   relatedPaths?: string[];
 };
 
 export type SearchResult = {
-  /** Ranked search results. */
   results: SearchResultItem[];
-  /** Total number of matches found (may exceed results.length when limited). */
   totalFound: number;
-  /** Human-readable status message. */
   message: string;
 };
 
@@ -144,20 +260,11 @@ export type BrvJsonResponse<T = unknown> = {
   data: T;
 };
 
-export type BrvQueryData = {
-  status: "completed" | "error";
-  event?: string;
-  taskId?: string;
-  result?: string;
-  content?: string;
-  message?: string;
-  error?: string;
-  /** Structured recall payload surfaced by newer `brv query --format json` envelopes; absent on older CLIs. */
-  matchedDocs?: RecallMatchedDoc[];
-  tier?: RecallTier;
-  durationMs?: number;
-  topScore?: number;
-};
+/**
+ * Shape of `brv query --format json` data field. Mirrors `QueryToolModeResult`
+ * with a small wrapper for the outer status field (error case).
+ */
+export type BrvQueryData = QueryToolModeResult;
 
 export type BrvSearchData = {
   status: "completed" | "error";
@@ -167,6 +274,43 @@ export type BrvSearchData = {
   error?: string;
 };
 
+/**
+ * Shape of `brv curate "<intent>" --format json` (kickoff phase).
+ * Returns a sessionId and the prompt the agent should follow.
+ */
+export type BrvCurateKickoffData = {
+  status: "needs-llm-step";
+  step: "generate-html";
+  sessionId: string;
+  prompt: string;
+};
+
+/**
+ * Shape of `brv curate --session <id> --response '<...>' --format json` (continuation).
+ * Either signals successful write or asks for correction.
+ */
+export type BrvCurateContinueData =
+  | {
+      ok: true;
+      status: "done";
+      filePath: string;
+    }
+  | {
+      ok: false;
+      status: "failed";
+      sessionId?: string;
+      step?: "correct-html";
+      errors: PersistHtmlError[];
+    };
+
+/**
+ * Legacy `brv curate "<text>" --detach` response. Kept so `process.ts`'s
+ * deprecated `brvCurate()` helper still compiles. Not used by the v2 bridge
+ * (`BrvBridge.persist()` throws), but exported for downstream callers that
+ * may have typed imports.
+ *
+ * @deprecated Removed in v3.0 alongside the legacy `persist()` method.
+ */
 export type BrvCurateData = {
   status: "completed" | "queued" | "error";
   event?: string;
